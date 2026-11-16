@@ -3,155 +3,161 @@
 ## Context
 
 First feature of the project: user registration with optional email confirmation (OTP or magic link).
-The original draft of this document was written for no particular stack and departed from
-[technical_specification.md](technical_specification.md) (the source of truth) in several places.
-This plan fixes those departures, ties the work to this NestJS + Fastify + TypeORM codebase, and splits it into small,
-reviewable steps. Each step ends with a manual verification.
 
-**Spec sections implemented:** §2 "Registration Flow", §2 "Email Challenge Protocols", §2 "Challenge Tables & `consumed_reason` Enum",
-§4 "Safe Profile Contract", plus the cross-cutting rules in §1: the error code table, "DTO Whitelisting" and "Error Masking & Anti-Enumeration".
+**Source of truth for registration:** the mentor's [registration_requirements.md](registration_requirements.md)
+("1.0 Регистрация"). Where it disagrees with [technical_specification.md](technical_specification.md), the mentor's doc
+wins. The spec still applies to everything the mentor's doc doesn't cover (error `code` values and shape from §1, DTO
+whitelisting, config key validation).
 
-> §2: "`password`: Length 8 ≤ length ≤ 128 … at least one letter and one digit." "Argon2id (recommended default)."
-> "Disabled (`false`): Atomically creates the user record with `status = "active"` … Returns `201 Created` with the Safe Profile DTO."
-> "Enabled (`true`): … `status = "pending"` … Returns `202 Accepted` with `{confirmationRequired, method, attemptId, expiresInSeconds, resendAfterSeconds}`."
-> "OTP: 6-digit … 10-minute TTL. Maximum 5 submission attempts (the 5th attempt can be valid) … HMAC-SHA256(code, LOGIN_CHALLENGE_HMAC_KEY)."
-> "Magic Link: 32-byte … base64url … Sent to the user as `attemptId.secret` … strictly handled via `POST /auth/register/confirm`."
-> "Resend: at most 1 request every 60 seconds per attempt. Revokes previous secret (`consumed_reason = "replaced"`), resets attempt counter, fresh 10-minute TTL."
+**Sections implemented:** mentor's doc §1.1–1.6 (contract, errors, audit, non-functional requirements) and the
+"Модель" / "Понятия" theory sections; spec §1 error table and "DTO Whitelisting".
 
-## Corrections to the draft
+> 1.3.1: "**Подтверждение выключено:** 201 Created, `id`, нормализованный `email`, `status: active`."
+> "**Подтверждение включено:** 202 Accepted, `confirmationRequired: true`, `method`, `attemptId`, `expiresInSeconds: 600`, `resendAfterSeconds: 60`."
+> 1.3.2: "Пятая попытка ещё может быть успешной. Пятый неверный ввод — это неверный код, и попытка после него погашена.
+> Следующий запрос, даже с верным кодом, отклоняется как исчерпанный лимит."
+> "Ссылка: 32 случайных байта. Попытка находится по HMAC токена, идентификатор в него не входит."
+> `POST /auth/register/resend` — `email`: "Не чаще 1 раза в 60 секунд … заново запускает TTL и обнуляет счётчик попыток."
+> 1.4: "**409** — email уже зарегистрирован … **503** — письмо не отправлено. Запись `pending` и попытка при этом сохранены."
 
-| Draft | Spec / decision |
-|---|---|
-| Stack options, `DATABASE_URL` | Fixed stack. Existing `POSTGRES_*` config |
-| `REQUIRE_EMAIL_CONFIRMATION`, `APP_SECRET_HMAC` | `REGISTRATION_EMAIL_CONFIRMATION_ENABLED`, `LOGIN_CHALLENGE_HMAC_KEY` (Joi: ≥ 32 bytes, otherwise the app refuses to boot) |
-| `status`: pending/active | Postgres enum with 5 values: `pending, active, blocked, deleting, deleted`. Also `display_name` and `photo_key` columns so `SafeProfileDto` can be built |
-| No `consumed_reason` | `consumed_reason` enum: `confirmed, replaced, attempts_exhausted, user_inactive` |
-| Resend updates the challenge in place | Resend **creates a new row** and marks the old one `replaced`. Response returns the new `attemptId` |
-| Magic link looked up by `secret_hash` index | Token is `attemptId.secret`: look up by PK, then compare HMACs with `timingSafeEqual` |
-| 201 returns `{id,email,status}` | 201 / 200 return the 7-field `SafeProfileDto` |
-| 409 on existing email | **Enumeration-safe** (decided, details below). 409 only when confirmation is OFF |
-| Keep pending user on SMTP failure | **Roll back** (decided). Send inside the transaction, 503 `service_unavailable` on failure |
-| Resend body `{email}`, 400 if no user | Body `{attemptId}`: per-attempt cooldown, no enumeration |
-| bcrypt 72-byte cap | Argon2id, so the 128-char cap from the spec is enough |
-| Assign `user` role | **Deferred** (decided). The spec §3 bootstrap gives the role to role-less active users later |
-| Audit-log interceptor that filters bodies | Overkill. Write `Logger` event lines with ids only and never log request bodies |
-| Not covered | Concurrency: unique-violation race (Postgres `23505` error) and parallel OTP guesses (row lock) |
+## Where we depart from the spec (mentor's doc wins)
 
-## Decided behaviour (enumeration-safe registration)
+| Topic | technical_specification.md | This plan (mentor's doc) |
+|---|---|---|
+| Taken email | Anti-enumeration | Explicit **409** `conflict`, also for a `pending` email |
+| Response body | 7-field `SafeProfileDto` | `{ id, email, status }` (201 register, 200 confirm) |
+| Magic-link token | `attemptId.secret` | 32 random bytes, no id. Lookup by `HMAC(token)` |
+| Resend | Per attempt, new secret marks old `replaced` | Body `{ email }`. Same challenge row is updated in place |
+| `consumed_reason` enum | Required | Not used. `consumed_at` + `attempts` are enough |
+| Users status | 5-value enum | `pending`, `active` (more values get added by a later migration) |
 
-`POST /auth/register` with confirmation **ON**:
-- **New email:** in a transaction, create a `pending` user and a challenge, send the email. Return 202.
-- **Existing `pending` email:** if the latest challenge is less than 60 s old, return 202 with the same attemptId and send nothing (prevents email bombing).
-  Otherwise update `password_hash` (latest registration wins), mark the old challenge `replaced`, create a new one, send. Return 202.
-  This also rescues users who lost the first email.
-- **Existing `active`/other email:** still run argon2 hashing (keeps response time the same), send nothing, return 202 with a random **decoy** `attemptId`.
-- Every branch returns the same response shape, and the work done is similar enough that timing stays close.
+## Decided behaviour
 
-Confirmation **OFF**: there is nothing to hide behind (an account either gets created or it doesn't), so an existing email returns 409 `conflict`.
-Concurrent inserts are caught through the unique-constraint error `23505` and mapped to 409 (or to the pending branch).
+**Register** (`POST /auth/register`):
+- Validate → hash (Argon2id) → branch on `REGISTRATION_EMAIL_CONFIRMATION_ENABLED`.
+- **OFF:** insert an `active` user → **201** `{ id, email, status: "active" }`.
+- **ON:** in one transaction insert a `pending` user + a challenge (with `last_sent_at = now()`), **commit**, then send the email.
+  - Sent → **202** `{ confirmationRequired, method, attemptId, expiresInSeconds: 600, resendAfterSeconds: 60 }`.
+  - SMTP failed → set `last_sent_at = NULL` (nothing was delivered, so the secret is not valid and resend has no cooldown),
+    keep the user + challenge, return **503** `service_unavailable`.
+- Email already exists (any status), or Postgres unique violation `23505` from a parallel request → **409** `conflict`.
 
-`POST /auth/register/resend` with an unknown attemptId returns a decoy 202, so a resend can't be used to tell decoys from real ids.
+**Confirm** (`POST /auth/register/confirm`), body is exactly one of `{ attemptId, code }` or `{ token }`:
+- Runs whether the flag is on or off (the flag only affects new registrations).
+- In a transaction, load the challenge **with a row lock** (`SELECT … FOR UPDATE`) — by `id` for OTP, by `secret_hash = HMAC(token)` for a link.
+- Order of checks:
+  1. Not found → 400.
+  2. OTP and `attempts >= 5` → **429** `rate_limit_exceeded` (exhausted — even with the right code).
+  3. `consumed_at` set → 400.
+  4. Never delivered (`last_sent_at IS NULL`) or expired (`now > last_sent_at + 10 min`) → 400, **attempts unchanged**.
+  5. User is not `pending` → 400.
+  6. Secret mismatch (`timingSafeEqual` on the HMACs) → `attempts++`; if it just reached 5, set `consumed_at`. Return 400.
+  7. Match → user `active`, `consumed_at = now()` → **200** `{ id, email, status: "active" }`.
+- Every 400 has the same generic message (`bad_request`).
+
+**Resend** (`POST /auth/register/resend`, body `{ email }`):
+- Unknown email, or user not `pending` → 400 generic.
+- `last_sent_at` less than 60 s ago → **429**.
+- Otherwise, in a transaction: new secret → `UPDATE` the same row: `secret_hash`, `attempts = 0`, `consumed_at = NULL`,
+  `last_sent_at = now()`. Commit, send. This also revives an exhausted challenge (the mentor's doc: resend resets the counter).
+  The old code/link stops working because its hash is gone.
+- Sent → **202** (same body as register, same `attemptId`). SMTP failed → `last_sent_at = NULL`, **503**.
+
+### `expires_at`: computed, not stored
+
+The mentor's doc shows `expires_at` as a column and explains it is always `last_sent_at + 10 min` (a transitive
+dependency, so the table is only in 2NF and an update can forget one of the two fields). We **compute** it instead:
+`expires_at = last_sent_at + 600 s`. Resend then only touches `last_sent_at`, the update anomaly can't happen, and the
+table is in BCNF. `last_sent_at IS NULL` doubles as "never delivered".
 
 ## Steps
 
-### Step 0 — Fix boilerplate gaps that block this feature (known gaps from CLAUDE.md)
-- Migration naming: change the `migration:generate`/`create` scripts in `package.json` to emit `<ts>-<Name>.migration.ts`, or change the glob in
-  [database.module.ts](../src/core/database/database.module.ts) and [data-source.ts](../src/database/data-source.ts). Both must stay in sync.
-- Add `moduleNameMapper: { "^@/(.*)$": "<rootDir>/$1" }` to the jest config in `package.json` (and to `test/jest-e2e.json`, mapping to `<rootDir>/../src/$1`).
-- [main.ts](../src/main.ts): add `ValidationPipe({ whitelist, forbidNonWhitelisted: true, transform: true, exceptionFactory → bad_request })`.
-- Add a global exception filter `src/core/http/http-exception.filter.ts` that writes the spec error shape `{ statusCode, code, message }` through `FastifyReply`.
-  Add small helpers or exception classes for each `code` (`bad_request`, `conflict`, `rate_limit_exceeded`, `service_unavailable`).
-- Import `AuthModule` in [app.module.ts](../src/core/app/app.module.ts). Register `ThrottlerGuard` as `APP_GUARD`.
-- Add a `@Public()` decorator in `src/modules/auth/decorators/public.decorator.ts`. It only marks routes for now; the JWT guard that reads it comes with login.
-- Verify: `npm run build`, `npm test`, and `POST` an unknown field to any route → 400 `bad_request`.
+### Step 0 — Boilerplate gaps ✅ (commit `4c170e4`)
 
-### Step 1 — Config + Mailpit
-- Config keys, added to [config.types.ts](../src/core/config/config.types.ts), [config.validation.ts](../src/core/config/config.validation.ts) and `.env.example`:
-  `REGISTRATION_EMAIL_CONFIRMATION_ENABLED` (bool, default false), `REGISTRATION_CONFIRMATION_METHOD` (`otp|magic_link`),
-  `LOGIN_CHALLENGE_HMAC_KEY` (required, min 32 bytes), `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER?`, `SMTP_PASS?`, `SMTP_FROM`,
-  `FRONTEND_BASE_URL` (used to build the magic-link URL).
-- Add a `mailpit` service to `docker-compose.yml` (SMTP on 1025, UI on 8025).
-- Verify: the app refuses to boot when the HMAC key is short. Mailpit UI opens at http://localhost:8025.
+### Step 1 — Config + Mailpit (in progress)
+- Keys already added: `REGISTRATION_EMAIL_CONFIRMATION_ENABLED`, `REGISTRATION_CONFIRMATION_METHOD`,
+  `LOGIN_CHALLENGE_HMAC_KEY` (≥ 32 bytes, `minBytes` — TODO(human)), `SMTP_*`, `FRONTEND_BASE_URL`.
+- **Add:** `REGISTRATION_RATE_LIMIT` (requests per minute per IP, default 10). The mentor's doc §1.6 says the registration threshold is set in config.
+- Mailpit service in `docker-compose.yml` (done).
+- Verify: `npx jest src/core/config`, app refuses to boot with a short HMAC key, http://localhost:8025 opens.
 
 ### Step 2 — `users` table (UsersModule)
-- `src/modules/users/entities/user.entity.ts`: `id` uuid, `email` varchar(255) unique, `password_hash`, `display_name` null,
-  `photo_key` null, `status` enum (5 values, default `pending`), `created_at` / `updated_at` timestamptz.
-  The email is already normalized by the DTO, so a plain unique index is enough. Add `CHECK (email = lower(btrim(email)))` as a safety net in the database.
-- `src/modules/users/dto/safe-profile.dto.ts` + a `toSafeProfile(user)` mapper (`photoUrl` = `/users/{id}/photo` or null). Unit test.
-- Add a `UsersService` with `findByEmail` and `create`, exported from `UsersModule`.
-- Generate the migration, review the SQL, check that `down()` really undoes `up()`, then run it.
-- Verify: run `\d users` in psql and `npm run migration:show`.
+- `src/modules/users/entities/user.entity.ts`: `id` uuid, `email` varchar(255) unique, `password_hash` text,
+  `status` enum `pending|active` (default `pending`), `created_at` / `updated_at` timestamptz.
+- `CHECK (email = lower(btrim(email)))` as a database-side safety net for normalization.
+- `UsersService` (`findByEmail`, `create`), exported from `UsersModule`.
+- `src/modules/auth/dto/registered-user.dto.ts` + mapper `toRegisteredUser(user) → { id, email, status }`. Unit test.
+- Generate the migration, read the SQL, check `down()`, run it. Verify: `\d users`, `npm run migration:show`.
 
 ### Step 3 — `registration_challenges` table (AuthModule)
-- `src/modules/auth/entities/registration-challenge.entity.ts`: `id` uuid, `user_id` FK→users ON DELETE CASCADE, `method` enum,
-  `secret_hash` char(64), `attempts` int default 0, `created_at` (used as "sent at" for the cooldown), `expires_at`, `consumed_at` null,
-  `consumed_reason` enum null. Add `CHECK ((consumed_at IS NULL) = (consumed_reason IS NULL))` and an index on `user_id`.
+- `id` uuid, `user_id` FK → users ON DELETE CASCADE, **unique** (one challenge per user — resend updates it),
+  `method` enum `otp|magic_link`, `secret_hash` char(64) **unique** (magic-link lookup), `attempts` int default 0,
+  `last_sent_at` timestamptz null, `consumed_at` timestamptz null, `created_at`.
 - Migration, verified the same way as step 2.
 
 ### Step 4 — Security primitives (pure, unit-tested)
-- New dependency: `argon2`, for Argon2id as the spec recommends.
-- `src/modules/auth/password-hasher.service.ts`: `hash` and `verify` (argon2id).
-- `src/modules/auth/challenge-secret.service.ts`: `generateOtp()` (`crypto.randomInt(0, 1e6)`, zero-padded),
-  `generateMagicSecret()` (`randomBytes(32).toString('base64url')`), `hmac(secret)` (HMAC-SHA256 with `LOGIN_CHALLENGE_HMAC_KEY`, hex),
-  `matches(raw, storedHash)` (length check + `timingSafeEqual`).
-- `src/modules/auth/dto/register.dto.ts`: `@Transform` trim + lowercase, `@IsEmail`, `@MaxLength(255)`. Password: 8–128 chars,
-  `\p{L}` (a letter in any script) and `\d`. **(Learn by Doing: password policy validation.)**
-- Unit tests: normalization edge cases, password policy matrix, OTP format, HMAC matches/mismatches.
+- Dependency: `argon2`.
+- `password-hasher.service.ts`: `hash`, `verify` (Argon2id).
+- `challenge-secret.service.ts`: `generateOtp()` (`crypto.randomInt(0, 1_000_000)`, zero-padded to 6),
+  `generateMagicToken()` (`randomBytes(32).toString('base64url')`), `hmac(secret)` (HMAC-SHA256, hex),
+  `matches(raw, storedHash)` (`timingSafeEqual`).
+- `dto/register.dto.ts`: email `@Transform` trim + lowercase, `@IsEmail`, `@MaxLength(255)`. Password **not trimmed**,
+  8–128 chars, at least one `\p{L}` and one `\d`. **(Learn by Doing: password policy.)**
+- Unit tests: normalization, password matrix (incl. `секрет12` ✓, leading/trailing spaces kept), OTP format, HMAC match/mismatch.
 
 ### Step 5 — Mail
-- New dependency: `nodemailer` (+ `@types/nodemailer`), the standard SMTP client.
-- `src/modules/mail/mail.service.ts` (`MailModule`): `sendRegistrationOtp(email, code)` and `sendRegistrationMagicLink(email, token)`.
-  Link format: `${FRONTEND_BASE_URL}/register/confirm#token=<attemptId.secret>`. The URL fragment never reaches servers or `Referer` headers.
-  The frontend page POSTs the token, so opening the link does nothing on the server.
-- SMTP errors become 503 `service_unavailable`. The service sits behind a class token, so tests can mock it or make it throw.
-- Verify: a small manual call sends a message that shows up in Mailpit.
+- Dependency: `nodemailer` (+ `@types/nodemailer`).
+- `MailModule` / `MailService`: `sendRegistrationOtp(email, code)`, `sendRegistrationMagicLink(email, token)`.
+  Link: `${FRONTEND_BASE_URL}/register/confirm#token=<token>` — opening it does nothing on the server; a page (or you, with curl) POSTs the token.
+- Throws a typed `MailDeliveryError`; the caller turns it into 503. Mockable in tests.
+- Verify: a manual send shows up in Mailpit.
 
 ### Step 6 — `POST /auth/register`, confirmation OFF
-- `auth.controller.ts` (`@Public()`, `@Throttle`), `registration.service.ts`.
-- New email: hash, insert an `active` user, return 201 + SafeProfile. Existing email or `23505`: 409 `conflict`.
-- Unit tests with a mocked repository. Verify: run curl twice → 201, then 409. `SELECT` shows `status=active` and an argon2 hash.
+- `auth.controller.ts` (`@Public()`, `@Throttle` from `REGISTRATION_RATE_LIMIT`), `registration.service.ts`.
+- 201 + `{ id, email, status }`. Existing email / `23505` → 409.
+- Unit tests with a mocked repository. Verify: curl twice → 201 then 409; `User@Example.com ` → 409 too; `SELECT` shows an `$argon2id$` hash.
 
 ### Step 7 — `POST /auth/register`, confirmation ON
-- `@Transactional()` flow covering the three branches in "Decided behaviour". The email is sent last, inside the transaction, so a failure rolls everything back and returns 503.
-- Use `@HttpCode` / `reply.status` to switch between 201 and 202 depending on config.
-- Unit tests for each branch and for the SMTP failure rollback. Verify: curl → 202, the code appears in Mailpit, the response contains no secret.
+- `@Transactional()` insert of user + challenge, then send **after commit**. Failure → `last_sent_at = NULL`, 503.
+- Status 201 vs 202 chosen at runtime (`reply.status(...)`).
+- Unit tests: happy path, 409 for a `pending` email, SMTP failure keeps rows and returns 503.
+- Verify: curl → 202, code visible in Mailpit, not in the response. Stop Mailpit → 503, `SELECT` shows the pending user.
 
 ### Step 8 — `POST /auth/register/confirm`
-- Body is either `{ attemptId, code }` (OTP) or `{ token: "attemptId.secret" }` (magic link). A DTO checks that exactly one form is used.
-- In a transaction, `SELECT … FOR UPDATE` the challenge (TypeORM `lock: { mode: 'pessimistic_write' }`). This makes parallel guesses wait, so none of them can skip the attempt counter.
-- Order of checks **(Learn by Doing: this decision sequence)**:
-  not found / consumed / expired → 400 `bad_request` (attempts stay unchanged) → user no longer `pending` → consume with `user_inactive`, 400
-  → secret mismatch → `attempts++`. If this is the 5th failure, consume with `attempts_exhausted` and return 429 `rate_limit_exceeded`, otherwise 400
-  → match → consume with `confirmed`, set the user `active`, return 200 + SafeProfile.
-- All 400s carry the same generic message.
-- Unit tests: wrong code ×4 then right code on the 5th → 200. Wrong ×5 → 429, then 400. Expired, replaced and inactive cases.
+- DTO: exactly one of `{ attemptId (uuid), code (6 digits) }` or `{ token }`.
+- Pessimistic row lock so parallel guesses can't skip the counter.
+- Decision sequence from "Decided behaviour". **(Learn by Doing: the check order.)**
+- Unit tests: wrong ×4 then right → 200. Wrong ×5 → the 5th is 400, the 6th (even correct) → 429. Expired → 400 with
+  attempts unchanged. Already confirmed → 400. Magic link: right token → 200, reused → 400.
 
 ### Step 9 — `POST /auth/register/resend`
-- Body `{ attemptId }`. Unknown id → decoy 202. Consumed or expired-and-confirmed → 400. Less than 60 s since the challenge's `created_at` → 429 `rate_limit_exceeded`.
-- Otherwise, in a transaction: mark the old challenge `replaced`, create a new one (same method, attempts 0, fresh TTL), send the email, return 202 with the new attemptId.
-- Unit tests for the cooldown, replacement, and showing the old code no longer works.
+- Unknown / non-pending → 400. Cooldown → 429. Otherwise in-place update, send, 202 (or 503).
+- Unit tests: cooldown, old code fails after resend, exhausted challenge works again after resend, retry right after a 503.
 
 ### Step 10 — Rate limits + logging
-- `@Throttle` per route. The spec gives no numbers for registration, so we pick them, close to the login figure: register 10/min/IP, confirm 30/min, resend 10/min.
-  Note: the throttler keeps its counters in each process's memory, so the limits are per instance. Fine for now.
-- `Logger` event lines (`registration.created`, `registration.challenge_sent`, `registration.confirmed`, `registration.confirm_failed{reason}`)
-  with user and challenge ids only. No emails in failure logs, and no bodies, codes, tokens or hashes ever.
+- `@Throttle`: register from config; resend 10/min/IP on top of the 60 s per-email cooldown.
+- `Logger` events with ids only: `registration.created`, `registration.failed{reason}`, `registration.email_sent`,
+  `registration.email_failed`, `registration.confirmed`, `registration.confirm_failed{reason}`.
+  Never passwords, hashes, codes, tokens or whole request bodies.
 
-### Step 11 — e2e
-- Rewrite `test/app.e2e-spec.ts` to use `FastifyAdapter` + `.ready()`, a real Postgres test database, and Mailpit's API (`GET /api/v1/messages`) to read codes.
-- Flows: OFF → 201 / 409. ON + OTP → 202, wrong×4, right → 200, active in the database. Exhaustion → 429. Resend → old code 400, new code 200.
-  Magic link → POST token → 200. Existing active email → 202 decoy and no mail sent. SMTP down → 503 with no rows left behind.
+### Step 11 — API description (mentor's doc §1.6: "описание API")
+- `@nestjs/swagger` with the Fastify adapter, decorators on the three endpoints and their DTOs, UI at `/docs`.
 
-## Learn-by-Doing points (one at a time, as each step comes up)
-1. Password policy validation in `register.dto.ts` (step 4).
-2. The confirm decision sequence in `registration.service.ts` (step 8).
+### Step 12 — e2e
+- Fastify-based e2e app, a real Postgres test database, Mailpit API (`GET /api/v1/messages`) to read codes.
+- Flows: OFF → 201 / 409. ON + OTP → 202, wrong ×4, right → 200. Exhaustion → 400 then 429. Resend → old code 400, new 200.
+  Magic link → POST token → 200. Pending email → 409. SMTP down → 503, rows kept, resend after Mailpit is back → 202.
+
+## Learn-by-Doing points
+1. `minBytes` Joi validator (step 1, in progress).
+2. Password policy in `register.dto.ts` (step 4).
+3. Confirm decision sequence in `registration.service.ts` (step 8).
 
 ## Out of scope (mention, don't build)
-`user` role assignment (RBAC), cleanup of stale pending users, auto-login cookies after confirm (needs JWT/login), CSRF guard,
-outbox pattern for email.
+`user` role assignment (comes with RBAC, in the same transaction that makes the user `active`), cleanup of stale
+`pending` users, CORS origin allowlist (not needed while the client is an HTTP tool), login/JWT cookies, outbox pattern for email.
 
 ## Verification (end-to-end)
-`docker compose up -d` (Postgres + Mailpit) → `npm run migration:run` → `npm run build` → `npm test` → `npm run test:e2e`.
-Manual check: register with each config combination using curl, read the code at http://localhost:8025, confirm, and run
-`SELECT email,status FROM users; SELECT attempts,consumed_reason FROM registration_challenges;`
-
+`docker compose up -d` → `npm run migration:run` → `npm run build` → `npm test` → `npm run test:e2e`.
+Manual: register with each config combination, read the code at http://localhost:8025, confirm, then
+`SELECT email, status FROM users; SELECT attempts, last_sent_at, consumed_at FROM registration_challenges;`

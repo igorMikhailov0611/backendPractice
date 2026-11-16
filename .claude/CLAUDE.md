@@ -5,6 +5,11 @@ NestJS 11 + Fastify + TypeORM + PostgreSQL monolith. The full product requiremen
 behaviour, status codes, error codes, table schemas and limits. Read the relevant section before
 implementing any feature, and quote the section you are implementing in your plan.
 
+**Exception — registration:** for `POST /auth/register`, `/register/confirm` and `/register/resend` the mentor's
+[docs/registration_requirements.md](../docs/registration_requirements.md) wins over the spec wherever they disagree
+(explicit 409, `{id, email, status}` responses, keep `pending` on SMTP failure, resend by `email`, magic-link token
+without an id). The reconciled decisions are in [docs/registration_feature_implementation_plan.md](../docs/registration_feature_implementation_plan.md).
+
 ## Who you are working with
 
 The developer is an experienced **frontend** developer learning backend to become fullstack. This is a
@@ -79,7 +84,8 @@ src/modules/<feature>/
   `synchronize: true`. Use `@Transactional()` from `typeorm-transactional` for multi-write operations.
 - **Errors:** responses must follow the spec's error shape with a machine-readable `code`
   (`bad_request`, `invalid_session`, `permission_denied`, `conflict`, …) — see the status table in spec §1.
-- **Responses:** users are only ever returned as the 7-field `SafeProfileDto` (spec §4). Never return entities directly.
+- **Responses:** users are only ever returned as the 7-field `SafeProfileDto` (spec §4) — except the registration
+  endpoints, which return `{ id, email, status }` per the mentor's doc. Never return entities directly.
 - **Security defaults from the spec:** endpoints are private by default (`@Public()` opt-out), auth comes from
   HttpOnly cookies only, never log secrets/passwords/tokens, auth failures return generic messages.
 - Tests use Jest + `@nestjs/testing`. Unit test services with mocked repositories; e2e for HTTP flows.
