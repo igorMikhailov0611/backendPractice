@@ -91,7 +91,8 @@ table is in BCNF. `last_sent_at IS NULL` doubles as "never delivered".
 
 ### Step 3 — `registration_challenges` table (AuthModule)
 - `id` uuid, `user_id` FK → users ON DELETE CASCADE, **unique** (one challenge per user — resend updates it),
-  `method` enum `otp|magic_link`, `secret_hash` char(64) **unique** (magic-link lookup), `attempts` int default 0,
+  `method` enum `otp|magic_link`, `secret_hash` char(64) with a **partial** unique index `WHERE method = 'magic_link'`
+  (magic-link lookup; OTP hashes repeat across users because there are only 10⁶ codes, so they must not be unique), `attempts` int default 0,
   `last_sent_at` timestamptz null, `consumed_at` timestamptz null, `created_at`.
 - Migration, verified the same way as step 2.
 
