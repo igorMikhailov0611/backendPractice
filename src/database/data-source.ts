@@ -22,7 +22,7 @@ export const dataSource = new DataSource({
   entities: [__dirname + '/../**/*.entity{.ts,.js}'],
 
   migrationsTableName: 'migrations',
-  migrations: [__dirname + '/migrations/*.migration{.ts,.js}'],
+  migrations: [__dirname + '/migrations/*-*{.ts,.js}'],
 
   synchronize: false,
   logging: process.env.POSTGRES_LOGGING === 'true',

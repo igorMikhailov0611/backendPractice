@@ -1,5 +1,9 @@
 import { Module } from '@nestjs/common';
-import { ThrottlerModule as NestThrottlerModule } from '@nestjs/throttler';
+import { APP_GUARD } from '@nestjs/core';
+import {
+  ThrottlerGuard,
+  ThrottlerModule as NestThrottlerModule,
+} from '@nestjs/throttler';
 
 import { ConfigModule } from '@/core/config/config.module';
 import { ConfigService } from '@/core/config/config.service';
@@ -22,6 +26,7 @@ import { ConfigService } from '@/core/config/config.service';
       },
     }),
   ],
+  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
   exports: [NestThrottlerModule],
 })
 export class ThrottlerModule {}
