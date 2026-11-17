@@ -13,7 +13,9 @@ import { RegistrationThrottle } from '@/core/throttler/throttler.decorators';
 import { Public } from './decorators/public.decorator';
 import { ConfirmRegistrationDto } from './dto/confirm-registration.dto';
 import { RegisterDto } from './dto/register.dto';
+import { ConfirmationRequiredDto } from './dto/confirmation-required.dto';
 import { RegisteredUserDto } from './dto/registered-user.dto';
+import { ResendRegistrationDto } from './dto/resend-registration.dto';
 import {
   RegistrationResult,
   RegistrationService,
@@ -58,5 +60,18 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   confirm(@Body() dto: ConfirmRegistrationDto): Promise<RegisteredUserDto> {
     return this.registration.confirm(dto);
+  }
+
+  /**
+   * Body: `{ email }`. Replaces the code/link of a pending user's challenge and emails it again.
+   * 202 (same body as register, same attemptId), 400 for an unknown / non-pending email,
+   * 429 within 60 s of the last email, 503 if SMTP fails (rows kept, retry allowed right away).
+   * The per-IP limit (10/min) comes in step 10.
+   */
+  @Public()
+  @Post('register/resend')
+  @HttpCode(HttpStatus.ACCEPTED)
+  resend(@Body() dto: ResendRegistrationDto): Promise<ConfirmationRequiredDto> {
+    return this.registration.resend(dto);
   }
 }

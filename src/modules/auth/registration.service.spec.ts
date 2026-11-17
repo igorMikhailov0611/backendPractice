@@ -460,5 +460,151 @@ describe('RegistrationService', () => {
         expect(await confirmStatus(otp(RIGHT_CODE))).toBe(400);
       });
     });
+    /**
+     * Resend shares the confirm fixtures (the same fake row), so "resend, then confirm" runs end to end
+     * against one piece of state. The secret fakes become realistic here: a new code gets a new hash.
+     */
+    describe('resend', () => {
+      const resend = () => service.resend({ email: 'a@example.com' });
+      const resendError = () =>
+        resend().then(
+          () => {
+            throw new Error('expected resend() to throw');
+          },
+          (e: ApiException) => e,
+        );
+
+      beforeEach(() => {
+        row.secretHash = `hmac(${RIGHT_CODE})`;
+        row.lastSentAt = new Date(Date.now() - 2 * 60_000); // outside the cooldown
+        users.findByEmail.mockImplementation(() => Promise.resolve(account));
+        secrets.matches.mockImplementation(
+          (raw: string, stored: string) => `hmac(${raw})` === stored,
+        );
+        secrets.generateOtp.mockReturnValue('654321');
+        challenges.update.mockImplementation(
+          (_id: string, patch: Partial<RegistrationChallenge>) => {
+            Object.assign(row, patch);
+            return Promise.resolve({ affected: 1 });
+          },
+        );
+      });
+
+      it("202 body: same attemptId, the challenge's method, no secret", async () => {
+        const body = await resend();
+
+        expect(body).toEqual({
+          confirmationRequired: true,
+          method: ChallengeMethod.Otp,
+          attemptId,
+          expiresInSeconds: 600,
+          resendAfterSeconds: 60,
+        });
+        expect(JSON.stringify(body)).not.toContain('654321');
+        expect(mail.sendRegistrationOtp).toHaveBeenCalledWith(
+          'a@example.com',
+          '654321',
+        );
+      });
+
+      it("locks the user's challenge row", async () => {
+        await resend();
+
+        expect(challenges.findOne).toHaveBeenCalledWith({
+          where: { userId: 'u1' },
+          lock: { mode: 'pessimistic_write' },
+        });
+      });
+
+      it('updates the same row: new hash, attempts 0, not consumed, TTL restarted', async () => {
+        row.attempts = 3;
+        const before = Date.now();
+
+        await resend();
+
+        expect(row.secretHash).toBe('hmac(654321)');
+        expect(row.attempts).toBe(0);
+        expect(row.consumedAt).toBeNull();
+        expect(row.lastSentAt!.getTime()).toBeGreaterThanOrEqual(before);
+        expect(challenges.create).not.toHaveBeenCalled();
+      });
+
+      it('cooldown: a second resend right away → 429, no email, row unchanged', async () => {
+        await resend();
+        mail.sendRegistrationOtp.mockClear();
+        const hashAfterFirst = row.secretHash;
+
+        const error = await resendError();
+
+        expect(error.getStatus()).toBe(429);
+        expect(error.code).toBe('rate_limit_exceeded');
+        expect(mail.sendRegistrationOtp).not.toHaveBeenCalled();
+        expect(row.secretHash).toBe(hashAfterFirst);
+      });
+
+      it('old code fails after resend, the new one works', async () => {
+        await resend();
+
+        expect(await confirmStatus(otp(RIGHT_CODE))).toBe(400);
+        expect(await confirmStatus(otp('654321'))).toBe(200);
+      });
+
+      it('an exhausted challenge works again after resend', async () => {
+        for (let i = 0; i < 5; i++) await confirmStatus(otp('000000'));
+        expect(await confirmStatus(otp(RIGHT_CODE))).toBe(429);
+
+        await resend();
+
+        expect(await confirmStatus(otp('654321'))).toBe(200);
+      });
+
+      it('SMTP failure → 503 and last_sent_at NULL; a retry right away is allowed → 202', async () => {
+        mail.sendRegistrationOtp.mockRejectedValueOnce(new MailDeliveryError());
+
+        const error = await resendError();
+        expect(error.getStatus()).toBe(503);
+        expect(error.code).toBe('service_unavailable');
+        expect(row.lastSentAt).toBeNull();
+
+        await expect(resend()).resolves.toMatchObject({ attemptId });
+      });
+
+      it("keeps the challenge's method even if the config now says otherwise", async () => {
+        row.method = ChallengeMethod.MagicLink;
+        config.REGISTRATION_CONFIRMATION_METHOD = ChallengeMethod.Otp;
+
+        const body = await resend();
+
+        expect(body.method).toBe(ChallengeMethod.MagicLink);
+        expect(mail.sendRegistrationMagicLink).toHaveBeenCalledWith(
+          'a@example.com',
+          'magic-token',
+        );
+        expect(mail.sendRegistrationOtp).not.toHaveBeenCalled();
+      });
+
+      it('unknown email → 400 bad_request, nothing sent', async () => {
+        users.findByEmail.mockResolvedValue(null);
+
+        const error = await resendError();
+
+        expect(error.getStatus()).toBe(400);
+        expect(error.code).toBe('bad_request');
+        expect(mail.sendRegistrationOtp).not.toHaveBeenCalled();
+      });
+
+      it('active user → the same 400 as an unknown email', async () => {
+        const unknownBody = await (async () => {
+          users.findByEmail.mockResolvedValueOnce(null);
+          return (await resendError()).getResponse();
+        })();
+        account.status = UserStatus.Active;
+
+        const error = await resendError();
+
+        expect(error.getStatus()).toBe(400);
+        expect(error.getResponse()).toEqual(unknownBody);
+      });
+    });
   });
 });
