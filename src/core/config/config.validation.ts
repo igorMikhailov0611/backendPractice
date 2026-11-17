@@ -23,7 +23,8 @@ export const minBytes =
 
 export const configValidationSchema = Joi.object<Config>({
   PORT: Joi.number().port().required(),
-  NODE_ENV: Joi.string().valid('development', 'production').required(),
+  // 'test': Jest always sets NODE_ENV=test, and real env vars win over .env.
+  NODE_ENV: Joi.string().valid('development', 'production', 'test').required(),
 
   /**
    * Cookie secret

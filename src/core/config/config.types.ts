@@ -1,6 +1,6 @@
 export interface Config {
   PORT: number;
-  NODE_ENV: 'development' | 'production';
+  NODE_ENV: 'development' | 'production' | 'test';
 
   /**
    * Cookie secret
