@@ -136,7 +136,10 @@ table is in BCNF. `last_sent_at IS NULL` doubles as "never delivered".
 - Unit tests: cooldown, old code fails after resend, exhausted challenge works again after resend, retry right after a 503.
 
 ### Step 10 — Rate limits + logging
-- `@Throttle`: register from config; resend 10/min/IP on top of the 60 s per-email cooldown.
+- ~~`@Throttle`: register from config~~ ✅ done in step 6: named `registration` throttler in
+  `core/throttler/throttler.module.ts` (`REGISTRATION_RATE_LIMIT` per 60 s per IP), opted into with
+  `@RegistrationThrottle()` (config can't be read inside `@Throttle(...)` arguments, since decorators run before DI).
+- Resend: 10/min/IP on top of the 60 s per-email cooldown. A static `@Throttle({ default: { limit: 10, ttl: 60_000 } })` works here.
 - `Logger` events with ids only: `registration.created`, `registration.failed{reason}`, `registration.email_sent`,
   `registration.email_failed`, `registration.confirmed`, `registration.confirm_failed{reason}`.
   Never passwords, hashes, codes, tokens or whole request bodies.
