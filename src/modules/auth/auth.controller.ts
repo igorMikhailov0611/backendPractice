@@ -1,10 +1,19 @@
-import { Body, Controller, HttpStatus, Post, Res } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  HttpCode,
+  HttpStatus,
+  Post,
+  Res,
+} from '@nestjs/common';
 import type { FastifyReply } from 'fastify';
 
 import { RegistrationThrottle } from '@/core/throttler/throttler.decorators';
 
 import { Public } from './decorators/public.decorator';
+import { ConfirmRegistrationDto } from './dto/confirm-registration.dto';
 import { RegisterDto } from './dto/register.dto';
+import { RegisteredUserDto } from './dto/registered-user.dto';
 import {
   RegistrationResult,
   RegistrationService,
@@ -36,5 +45,18 @@ export class AuthController {
       reply.status(HttpStatus.ACCEPTED);
     }
     return result;
+  }
+
+  /**
+   * Body: `{ attemptId, code }` (OTP) or `{ token }` (magic link). The link in the email opens a page,
+   * and that page POSTs the token: a GET must never change state, or mail scanners that prefetch
+   * links would confirm accounts (spec §2 "Magic Link").
+   * 200 `{ id, email, status: "active" }`, 400 for any invalid/expired/used secret, 429 when exhausted.
+   */
+  @Public()
+  @Post('register/confirm')
+  @HttpCode(HttpStatus.OK)
+  confirm(@Body() dto: ConfirmRegistrationDto): Promise<RegisteredUserDto> {
+    return this.registration.confirm(dto);
   }
 }

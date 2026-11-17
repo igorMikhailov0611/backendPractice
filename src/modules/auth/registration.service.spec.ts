@@ -25,13 +25,24 @@ jest.mock('typeorm-transactional', () => ({
 
 describe('RegistrationService', () => {
   let service: RegistrationService;
-  const users = { findByEmail: jest.fn(), create: jest.fn() };
-  const challenges = { create: jest.fn(), save: jest.fn(), update: jest.fn() };
+  const users = {
+    findByEmail: jest.fn(),
+    findById: jest.fn(),
+    create: jest.fn(),
+    activate: jest.fn(),
+  };
+  const challenges = {
+    create: jest.fn(),
+    save: jest.fn(),
+    update: jest.fn(),
+    findOne: jest.fn(),
+  };
   const hasher = { hash: jest.fn() };
   const secrets = {
     generateOtp: jest.fn(),
     generateMagicToken: jest.fn(),
     hmac: jest.fn(),
+    matches: jest.fn(),
   };
   const mail = {
     sendRegistrationOtp: jest.fn(),
@@ -280,6 +291,174 @@ describe('RegistrationService', () => {
       mail.sendRegistrationOtp.mockRejectedValue(bug);
 
       await expect(service.register(dto)).rejects.toBe(bug);
+    });
+  });
+
+  describe('confirm', () => {
+    const attemptId = '3f2b8c1e-9d4a-4c6b-8e7f-1a2b3c4d5e6f';
+    const RIGHT_CODE = '123456';
+    const TOKEN = 'T'.repeat(43);
+    const otp = (code: string) => ({ attemptId, code });
+
+    /** A fake DB row: the service mutates it and saves it, so state carries over between calls. */
+    let row: RegistrationChallenge;
+    let account: User;
+
+    /** 200 on success, otherwise the error status. */
+    const confirmStatus = (body: object) =>
+      service.confirm(body).then(
+        () => 200,
+        (e: ApiException) => e.getStatus(),
+      );
+    const confirmError = (body: object) =>
+      service.confirm(body).then(
+        () => {
+          throw new Error('expected confirm() to throw');
+        },
+        (e: ApiException) => e,
+      );
+
+    beforeEach(() => {
+      account = user(UserStatus.Pending);
+      row = {
+        id: attemptId,
+        userId: 'u1',
+        method: ChallengeMethod.Otp,
+        secretHash: 'stored-hash',
+        attempts: 0,
+        consumedAt: null,
+        lastSentAt: new Date(Date.now() - 60_000),
+        createdAt: new Date(),
+      };
+
+      challenges.findOne.mockImplementation(
+        ({ where }: { where: Record<string, unknown> }) =>
+          Promise.resolve(
+            Object.entries(where).every(
+              ([k, v]) => row[k as keyof RegistrationChallenge] === v,
+            )
+              ? row
+              : null,
+          ),
+      );
+      challenges.save.mockImplementation((c: RegistrationChallenge) =>
+        Promise.resolve(c),
+      );
+      users.findById.mockImplementation(() => Promise.resolve(account));
+      users.activate.mockImplementation(() => {
+        account.status = UserStatus.Active;
+        return Promise.resolve();
+      });
+      secrets.hmac.mockImplementation((s: string) => `hmac(${s})`);
+      secrets.matches.mockImplementation(
+        (s: string) =>
+          s === (row.method === ChallengeMethod.Otp ? RIGHT_CODE : TOKEN),
+      );
+    });
+
+    it('right code → 200 with the active user, challenge consumed', async () => {
+      await expect(service.confirm(otp(RIGHT_CODE))).resolves.toEqual({
+        id: 'u1',
+        email: 'a@example.com',
+        status: 'active',
+      });
+      expect(users.activate).toHaveBeenCalledWith('u1');
+      expect(row.consumedAt).toBeInstanceOf(Date);
+    });
+
+    it('loads the challenge with a row lock', async () => {
+      await service.confirm(otp(RIGHT_CODE));
+
+      expect(challenges.findOne).toHaveBeenCalledWith({
+        where: { id: attemptId, method: ChallengeMethod.Otp },
+        lock: { mode: 'pessimistic_write' },
+      });
+    });
+
+    it('wrong ×4, then right → 400 ×4, then 200', async () => {
+      const statuses: number[] = [];
+      for (let i = 0; i < 4; i++)
+        statuses.push(await confirmStatus(otp('000000')));
+      statuses.push(await confirmStatus(otp(RIGHT_CODE)));
+
+      expect(statuses).toEqual([400, 400, 400, 400, 200]);
+      expect(row.attempts).toBe(4);
+    });
+
+    it('wrong ×5 → the 5th is 400 and consumes; the 6th, even right, is 429', async () => {
+      const statuses: number[] = [];
+      for (let i = 0; i < 5; i++)
+        statuses.push(await confirmStatus(otp('000000')));
+
+      expect(statuses).toEqual([400, 400, 400, 400, 400]);
+      expect(row.attempts).toBe(5);
+      expect(row.consumedAt).toBeInstanceOf(Date);
+
+      const sixth = await confirmError(otp(RIGHT_CODE));
+      expect(sixth.getStatus()).toBe(429);
+      expect(sixth.code).toBe('rate_limit_exceeded');
+      expect(users.activate).not.toHaveBeenCalled();
+    });
+
+    it('expired → 400, attempts unchanged', async () => {
+      row.lastSentAt = new Date(Date.now() - 11 * 60_000);
+
+      expect(await confirmStatus(otp('000000'))).toBe(400);
+      expect(row.attempts).toBe(0);
+      expect(challenges.save).not.toHaveBeenCalled();
+    });
+
+    it('never delivered (last_sent_at NULL, SMTP failed) → 400', async () => {
+      row.lastSentAt = null;
+
+      expect(await confirmStatus(otp(RIGHT_CODE))).toBe(400);
+      expect(users.activate).not.toHaveBeenCalled();
+    });
+
+    it('already confirmed → 400 on the second try', async () => {
+      expect(await confirmStatus(otp(RIGHT_CODE))).toBe(200);
+      expect(await confirmStatus(otp(RIGHT_CODE))).toBe(400);
+    });
+
+    it('unknown attemptId gets the same 400 body as a wrong code', async () => {
+      const wrong = await confirmError(otp('000000'));
+      challenges.findOne.mockResolvedValue(null);
+      const unknown = await confirmError(otp(RIGHT_CODE));
+
+      expect(unknown.getStatus()).toBe(400);
+      expect(unknown.getResponse()).toEqual(wrong.getResponse());
+    });
+
+    describe('magic link', () => {
+      beforeEach(() => {
+        row.method = ChallengeMethod.MagicLink;
+        row.secretHash = `hmac(${TOKEN})`;
+      });
+
+      it('finds the challenge by HMAC(token)', async () => {
+        await service.confirm({ token: TOKEN });
+
+        expect(challenges.findOne).toHaveBeenCalledWith({
+          where: {
+            secretHash: `hmac(${TOKEN})`,
+            method: ChallengeMethod.MagicLink,
+          },
+          lock: { mode: 'pessimistic_write' },
+        });
+      });
+
+      it('right token → 200, reused → 400', async () => {
+        expect(await confirmStatus({ token: TOKEN })).toBe(200);
+        expect(await confirmStatus({ token: TOKEN })).toBe(400);
+      });
+
+      it('unknown token → 400', async () => {
+        expect(await confirmStatus({ token: 'X'.repeat(43) })).toBe(400);
+      });
+
+      it('a magic-link challenge cannot be confirmed with attemptId + code', async () => {
+        expect(await confirmStatus(otp(RIGHT_CODE))).toBe(400);
+      });
     });
   });
 });

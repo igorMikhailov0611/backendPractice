@@ -12,6 +12,11 @@ import { User, UserStatus } from '@/modules/users/entities/user.entity';
 import { UsersService } from '@/modules/users/users.service';
 
 import { ChallengeSecrets } from './challenge-secrets.service';
+import {
+  ConfirmationOutcome,
+  decideConfirmation,
+} from './confirmation-decision';
+import { ConfirmRegistrationDto } from './dto/confirm-registration.dto';
 import { ConfirmationRequiredDto } from './dto/confirmation-required.dto';
 import { RegisterDto } from './dto/register.dto';
 import { RegisteredUserDto, toRegisteredUser } from './dto/registered-user.dto';
@@ -22,6 +27,7 @@ import {
 import { PasswordHasher } from './password-hasher.service';
 import {
   CHALLENGE_TTL_SECONDS,
+  MAX_OTP_ATTEMPTS,
   RESEND_COOLDOWN_SECONDS,
 } from './registration.constants';
 
@@ -31,6 +37,25 @@ const emailTaken = () =>
     HttpStatus.CONFLICT,
     'conflict',
     'Email is already registered',
+  );
+
+/**
+ * Every confirm failure except exhaustion gets this same answer (mentor's doc §1.3: "not found or already
+ * consumed → the same answer as a wrong code"), so a client can't tell which check failed.
+ */
+const invalidConfirmation = () =>
+  new ApiException(
+    HttpStatus.BAD_REQUEST,
+    'bad_request',
+    'Invalid or expired confirmation code',
+  );
+
+/** 5 wrong OTP inputs: even the right code is refused now (mentor's doc §1.4 → 429). */
+const attemptsExhausted = () =>
+  new ApiException(
+    HttpStatus.TOO_MANY_REQUESTS,
+    'rate_limit_exceeded',
+    'Too many attempts, request a new code',
   );
 
 /** `RegisteredUserDto` → 201 Created, `ConfirmationRequiredDto` → 202 Accepted (the controller picks). */
@@ -108,11 +133,18 @@ export class RegistrationService {
         throw error;
       }
 
-      this.logger.warn(`registration.failed reason=email_service_unavailable challengeId=${challenge.id}`);
+      this.logger.warn(
+        `registration.failed reason=email_service_unavailable challengeId=${challenge.id}`,
+      );
 
-      await this.challenges.update(challenge.id, { lastSentAt: null})
-      .catch(() => this.logger.error(`registration.reset_last_sent_failed challengeId=${challenge.id}`));
-      
+      await this.challenges
+        .update(challenge.id, { lastSentAt: null })
+        .catch(() =>
+          this.logger.error(
+            `registration.reset_last_sent_failed challengeId=${challenge.id}`,
+          ),
+        );
+
       throw new ApiException(
         HttpStatus.SERVICE_UNAVAILABLE,
         'service_unavailable',
@@ -160,6 +192,90 @@ export class RegistrationService {
     );
 
     return { user, challenge };
+  }
+
+  /**
+   * `POST /auth/register/confirm`. Works whether the flag is on or off now: it only affects new registrations.
+   *
+   * The DB work runs in `confirmLocked` and is COMMITTED before we throw. Throwing inside the transaction
+   * would roll back `attempts++`, and the 5-input limit would never be reached.
+   */
+  async confirm(dto: ConfirmRegistrationDto): Promise<RegisteredUserDto> {
+    const { outcome, user, challengeId } = await this.confirmLocked(dto);
+
+    if (outcome === 'match' && user) {
+      this.logger.log(
+        `registration.confirmed userId=${user.id} challengeId=${challengeId}`,
+      );
+      return toRegisteredUser(user);
+    }
+
+    this.logger.log(
+      `registration.confirm_failed reason=${outcome} challengeId=${challengeId ?? '-'}`,
+    );
+    throw outcome === 'exhausted' ? attemptsExhausted() : invalidConfirmation();
+  }
+
+  /**
+   * One transaction holding a row lock on the challenge (SELECT … FOR UPDATE): parallel requests for the
+   * same challenge wait for each other, so N parallel guesses can't all read `attempts = 0`.
+   */
+  @Transactional()
+  private async confirmLocked(dto: ConfirmRegistrationDto): Promise<{
+    outcome: ConfirmationOutcome;
+    user?: User;
+    challengeId?: string;
+  }> {
+    const challenge = await this.lockChallenge(dto);
+    const user = challenge ? await this.users.findById(challenge.userId) : null;
+    const now = new Date();
+
+    const outcome = decideConfirmation({
+      challenge,
+      userStatus: user?.status ?? null,
+      secretMatches:
+        challenge !== null &&
+        this.secrets.matches(dto.token ?? dto.code ?? '', challenge.secretHash),
+      now,
+    });
+
+    if (outcome === 'mismatch' && challenge) {
+      challenge.attempts += 1;
+      if (challenge.attempts >= MAX_OTP_ATTEMPTS) {
+        challenge.consumedAt = now; // the 5th wrong input consumes the challenge
+      }
+      await this.challenges.save(challenge);
+    }
+
+    if (outcome === 'match' && challenge && user) {
+      challenge.consumedAt = now;
+      await this.challenges.save(challenge);
+      await this.users.activate(user.id);
+      user.status = UserStatus.Active;
+    }
+
+    return { outcome, user: user ?? undefined, challengeId: challenge?.id };
+  }
+
+  /**
+   * OTP: by id. Magic link: by HMAC(token), since the token carries no id.
+   * The method is part of the lookup, so an OTP attemptId can't be confirmed with a token and vice versa.
+   */
+  private lockChallenge(
+    dto: ConfirmRegistrationDto,
+  ): Promise<RegistrationChallenge | null> {
+    const where =
+      dto.token !== undefined
+        ? {
+            secretHash: this.secrets.hmac(dto.token),
+            method: ChallengeMethod.MagicLink,
+          }
+        : { id: dto.attemptId, method: ChallengeMethod.Otp };
+
+    return this.challenges.findOne({
+      where,
+      lock: { mode: 'pessimistic_write' },
+    });
   }
 
   private sendSecret(

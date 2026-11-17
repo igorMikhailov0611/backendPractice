@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 
-import { User } from './entities/user.entity';
+import { User, UserStatus } from './entities/user.entity';
 
 export type CreateUserData = Pick<User, 'email' | 'passwordHash' | 'status'>;
 
@@ -23,6 +23,15 @@ export class UsersService {
   /** `email` must already be normalized (trimmed + lowercased) by the DTO. */
   findByEmail(email: string): Promise<User | null> {
     return this.users.findOneBy({ email });
+  }
+
+  findById(id: string): Promise<User | null> {
+    return this.users.findOneBy({ id });
+  }
+
+  /** pending → active, after a successful registration confirmation. */
+  async activate(id: string): Promise<void> {
+    await this.users.update(id, { status: UserStatus.Active });
   }
 
   /**
