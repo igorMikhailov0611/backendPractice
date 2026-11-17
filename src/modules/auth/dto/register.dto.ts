@@ -1,27 +1,14 @@
-import { Transform } from 'class-transformer';
-import {
-  IsEmail,
-  IsString,
-  Matches,
-  MaxLength,
-  MinLength,
-} from 'class-validator';
+import { IsString, Matches, MaxLength, MinLength } from 'class-validator';
+
+import { NormalizedEmail } from '../decorators/normalized-email.decorator';
 
 /**
  * Body of `POST /auth/register` (mentor's registration_requirements.md §1.3.1).
  * Unknown fields are rejected by the global ValidationPipe (forbidNonWhitelisted).
  */
 export class RegisterDto {
-  /**
-   * "Перед сравнением и записью обрезаются крайние пробелы, буквы приводятся к нижнему регистру."
-   * `user+tag@example.com` stays a separate address: no plus-stripping, no dot-removal.
-   * @Transform runs before the validators, so they see the normalized value.
-   */
-  @Transform(({ value }: { value: unknown }) =>
-    typeof value === 'string' ? value.trim().toLowerCase() : value,
-  )
-  @IsEmail({}, { message: 'email must be a valid email address' })
-  @MaxLength(255) // matches users.email varchar(255)
+  /** Trimmed + lowercased before validation (see NormalizedEmail). */
+  @NormalizedEmail()
   email: string;
 
   /**

@@ -20,6 +20,7 @@ import { ConfirmRegistrationDto } from './dto/confirm-registration.dto';
 import { ConfirmationRequiredDto } from './dto/confirmation-required.dto';
 import { RegisterDto } from './dto/register.dto';
 import { RegisteredUserDto, toRegisteredUser } from './dto/registered-user.dto';
+import { ResendRegistrationDto } from './dto/resend-registration.dto';
 import {
   ChallengeMethod,
   RegistrationChallenge,
@@ -30,6 +31,7 @@ import {
   MAX_OTP_ATTEMPTS,
   RESEND_COOLDOWN_SECONDS,
 } from './registration.constants';
+import { decideResend, ResendOutcome } from './resend-decision';
 
 /** 409 for a taken email (mentor's doc §1.4: explicit 409 is the default). */
 const emailTaken = () =>
@@ -56,6 +58,25 @@ const attemptsExhausted = () =>
     HttpStatus.TOO_MANY_REQUESTS,
     'rate_limit_exceeded',
     'Too many attempts, request a new code',
+  );
+
+/**
+ * Resend for an unknown email, an active user or a user without a challenge. One generic answer.
+ * (Not anti-enumeration: register already answers 409 for a taken email. It just keeps responses uniform.)
+ */
+const resendRefused = () =>
+  new ApiException(
+    HttpStatus.BAD_REQUEST,
+    'bad_request',
+    'Cannot resend a confirmation for this email',
+  );
+
+/** Mentor's doc §1.4: "повторная отправка раньше 60 секунд" → 429. */
+const resendTooSoon = () =>
+  new ApiException(
+    HttpStatus.TOO_MANY_REQUESTS,
+    'rate_limit_exceeded',
+    `Wait ${RESEND_COOLDOWN_SECONDS} seconds before requesting a new email`,
   );
 
 /** `RegisteredUserDto` → 201 Created, `ConfirmationRequiredDto` → 202 Accepted (the controller picks). */
@@ -126,41 +147,9 @@ export class RegistrationService {
     );
 
     // Step 2: outside the transaction. An email can't be rolled back, and SMTP can be slow.
-    try {
-      await this.sendSecret(email, method, secret);
-    } catch (error) {
-      if (!(error instanceof MailDeliveryError)) {
-        throw error;
-      }
+    await this.deliver(challenge, email, secret);
 
-      this.logger.warn(
-        `registration.failed reason=email_service_unavailable challengeId=${challenge.id}`,
-      );
-
-      await this.challenges
-        .update(challenge.id, { lastSentAt: null })
-        .catch(() =>
-          this.logger.error(
-            `registration.reset_last_sent_failed challengeId=${challenge.id}`,
-          ),
-        );
-
-      throw new ApiException(
-        HttpStatus.SERVICE_UNAVAILABLE,
-        'service_unavailable',
-        'Email service is unavailable',
-      );
-    }
-
-    this.logger.log(`registration.email_sent challengeId=${challenge.id}`);
-
-    return {
-      confirmationRequired: true,
-      method,
-      attemptId: challenge.id,
-      expiresInSeconds: CHALLENGE_TTL_SECONDS,
-      resendAfterSeconds: RESEND_COOLDOWN_SECONDS,
-    };
+    return this.confirmationRequired(challenge);
   }
 
   /**
@@ -276,6 +265,121 @@ export class RegistrationService {
       where,
       lock: { mode: 'pessimistic_write' },
     });
+  }
+
+  /**
+   * `POST /auth/register/resend` (mentor's doc §1.3.2). A new secret replaces the old one in the SAME row,
+   * so the attemptId stays the same, the old code/link stops working (its hash is gone), the TTL restarts
+   * and the attempt counter resets, which also revives an exhausted challenge.
+   *
+   * Works whether the confirmation flag is on or off now, and keeps the challenge's original method.
+   */
+  async resend(dto: ResendRegistrationDto): Promise<ConfirmationRequiredDto> {
+    const { outcome, challenge, secret } = await this.renewLocked(dto.email);
+
+    if (outcome !== 'send' || !challenge || !secret) {
+      this.logger.log(
+        `registration.resend_failed reason=${outcome} challengeId=${challenge?.id ?? '-'}`,
+      );
+      throw outcome === 'cooldown' ? resendTooSoon() : resendRefused();
+    }
+
+    // After commit, like register: the new hash is already the only valid one when the email goes out.
+    await this.deliver(challenge, dto.email, secret);
+
+    return this.confirmationRequired(challenge);
+  }
+
+  /**
+   * Row lock on the challenge (SELECT … FOR UPDATE): two parallel resends can't both pass the cooldown
+   * check. The second one waits, then sees `last_sent_at = now` and gets 429.
+   */
+  @Transactional()
+  private async renewLocked(email: string): Promise<{
+    outcome: ResendOutcome;
+    challenge?: RegistrationChallenge;
+    secret?: string;
+  }> {
+    const user = await this.users.findByEmail(email);
+    const challenge = user
+      ? await this.challenges.findOne({
+          where: { userId: user.id },
+          lock: { mode: 'pessimistic_write' },
+        })
+      : null;
+
+    const outcome = decideResend({
+      userStatus: user?.status ?? null,
+      challenge,
+      now: new Date(),
+    });
+    if (outcome !== 'send' || !challenge) {
+      return { outcome, challenge: challenge ?? undefined };
+    }
+
+    const secret =
+      challenge.method === ChallengeMethod.Otp
+        ? this.secrets.generateOtp()
+        : this.secrets.generateMagicToken();
+
+    challenge.secretHash = this.secrets.hmac(secret);
+    challenge.attempts = 0;
+    challenge.consumedAt = null;
+    challenge.lastSentAt = new Date();
+    await this.challenges.save(challenge);
+
+    return { outcome, challenge, secret };
+  }
+
+  /**
+   * Sends the secret. On SMTP failure: `last_sent_at = NULL` (nothing was delivered, so the secret is not
+   * valid and the resend cooldown doesn't apply), rows kept, 503 (mentor's doc §1.4).
+   */
+  private async deliver(
+    challenge: RegistrationChallenge,
+    email: string,
+    secret: string,
+  ): Promise<void> {
+    try {
+      await this.sendSecret(email, challenge.method, secret);
+    } catch (error) {
+      if (!(error instanceof MailDeliveryError)) {
+        throw error;
+      }
+
+      this.logger.warn(
+        `registration.email_failed reason=email_service_unavailable challengeId=${challenge.id}`,
+      );
+
+      await this.challenges
+        .update(challenge.id, { lastSentAt: null })
+        .catch(() =>
+          this.logger.error(
+            `registration.reset_last_sent_failed challengeId=${challenge.id}`,
+          ),
+        );
+
+      throw new ApiException(
+        HttpStatus.SERVICE_UNAVAILABLE,
+        'service_unavailable',
+        'Email service is unavailable',
+      );
+    }
+
+    this.logger.log(`registration.email_sent challengeId=${challenge.id}`);
+  }
+
+  /** The 202 body of register (confirmation ON) and resend. Never contains the secret. */
+  private confirmationRequired(
+    challenge: RegistrationChallenge,
+  ): ConfirmationRequiredDto {
+    return {
+      confirmationRequired: true,
+      method: challenge.method,
+      attemptId: challenge.id,
+      expiresInSeconds: CHALLENGE_TTL_SECONDS,
+      resendAfterSeconds: RESEND_COOLDOWN_SECONDS,
+    };
   }
 
   private sendSecret(
