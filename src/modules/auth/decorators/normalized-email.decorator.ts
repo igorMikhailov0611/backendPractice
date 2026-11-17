@@ -1,4 +1,5 @@
 import { applyDecorators } from '@nestjs/common';
+import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import { IsEmail, MaxLength } from 'class-validator';
 
@@ -11,6 +12,12 @@ import { IsEmail, MaxLength } from 'class-validator';
  */
 export const NormalizedEmail = () =>
   applyDecorators(
+    ApiProperty({
+      format: 'email',
+      maxLength: 255,
+      example: 'user@example.com',
+      description: 'Trimmed and lowercased by the server before use.',
+    }),
     Transform(({ value }: { value: unknown }) =>
       typeof value === 'string' ? value.trim().toLowerCase() : value,
     ),

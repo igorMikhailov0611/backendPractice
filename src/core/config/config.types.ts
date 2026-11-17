@@ -30,6 +30,9 @@ export interface Config {
   POSTGRES_LOGGING?: boolean;
   POSTGRES_MIGRATIONS_RUN?: boolean;
 
+  /** Serve the OpenAPI description + Swagger UI at /docs (mentor's doc §1.6). Off by default. */
+  API_DOCS_ENABLED?: boolean;
+
   /**
    * Registration (spec §2 "Registration Flow")
    */

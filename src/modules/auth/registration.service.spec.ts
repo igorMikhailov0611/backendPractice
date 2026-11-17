@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { QueryFailedError } from 'typeorm';
@@ -460,6 +461,61 @@ describe('RegistrationService', () => {
         expect(await confirmStatus(otp(RIGHT_CODE))).toBe(400);
       });
     });
+    /**
+     * Mentor's doc §1.5 / plan step 10: logs carry ids only. This runs every branch that logs and then
+     * scans EVERYTHING that reached the Nest Logger, so a leak added later in any log line fails here.
+     */
+    describe('logs', () => {
+      /**
+       * Values from the flow below that must never appear in a log line.
+       * The fixtures: email 'a@example.com', password 'secret12', hash '$argon2id$hash',
+       * OTP codes RIGHT_CODE ('123456') and '000000', HMACs rendered as 'hmac(<secret>)'.
+       */
+      const FORBIDDEN: string[] = [
+        'a@example.com',
+        'secret12',
+        '$argon2id$hash',
+        '000000',
+        '123456',
+        'hmac(123456)',
+      ];
+
+      // jest.spyOn patches the shared Logger.prototype: put the real methods back for the other tests.
+      afterEach(() => jest.restoreAllMocks());
+
+      it('contain no secrets, hashes or personal data', async () => {
+        const lines: string[] = [];
+        for (const level of ['log', 'warn', 'error'] as const) {
+          jest
+            .spyOn(Logger.prototype, level)
+            .mockImplementation((...args: unknown[]) => {
+              lines.push(args.map(String).join(' '));
+            });
+        }
+        config.REGISTRATION_EMAIL_CONFIRMATION_ENABLED = true;
+        config.REGISTRATION_CONFIRMATION_METHOD = ChallengeMethod.Otp;
+        challenges.save.mockImplementation((c: object) =>
+          Promise.resolve({ id: attemptId, ...c }),
+        );
+
+        // register: SMTP down → 503, then OK → 202
+        mail.sendRegistrationOtp.mockRejectedValueOnce(new MailDeliveryError());
+        await service.register(dto).catch(() => undefined);
+        await service.register(dto);
+        // confirm: wrong, then right
+        await confirmStatus(otp('000000'));
+        await confirmStatus(otp(RIGHT_CODE));
+        // resend for a now-active user → resend_failed
+        users.findByEmail.mockResolvedValue(account);
+        await service.resend({ email: dto.email }).catch(() => undefined);
+
+        expect(lines.length).toBeGreaterThan(5); // the flow really logged
+        for (const value of FORBIDDEN) {
+          expect(lines.filter((line) => line.includes(value))).toEqual([]);
+        }
+      });
+    });
+
     /**
      * Resend shares the confirm fixtures (the same fake row), so "resend, then confirm" runs end to end
      * against one piece of state. The secret fakes become realistic here: a new code gets a new hash.

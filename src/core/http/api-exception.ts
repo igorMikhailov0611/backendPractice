@@ -4,22 +4,26 @@ import { HttpException, HttpStatus } from '@nestjs/common';
  * Machine-readable error codes from spec §1 "Standardized HTTP Status & Error Codes".
  * `internal_error` is ours: the spec has no 500 row, but unexpected crashes still need a code.
  */
-export type ErrorCode =
-  | 'bad_request'
-  | 'invalid_session'
-  | 'invalid_credentials'
-  | 'permission_denied'
-  | 'ownership_denied'
-  | 'csrf_rejected'
-  | 'not_found'
-  | 'conflict'
-  | 'payload_too_large'
-  | 'unsupported_media_type'
-  | 'rate_limit_exceeded'
-  | 'authorization_unavailable'
-  | 'service_unavailable'
-  | 'gateway_timeout'
-  | 'internal_error';
+export const ERROR_CODES = [
+  'bad_request',
+  'invalid_session',
+  'invalid_credentials',
+  'permission_denied',
+  'ownership_denied',
+  'csrf_rejected',
+  'not_found',
+  'conflict',
+  'payload_too_large',
+  'unsupported_media_type',
+  'rate_limit_exceeded',
+  'authorization_unavailable',
+  'service_unavailable',
+  'gateway_timeout',
+  'internal_error',
+] as const;
+
+/** A runtime array + a derived type: the OpenAPI docs can list the values, the compiler still checks them. */
+export type ErrorCode = (typeof ERROR_CODES)[number];
 
 /**
  * Throw this from services/controllers when the response needs a specific `code`.

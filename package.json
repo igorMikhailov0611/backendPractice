@@ -28,10 +28,12 @@
   "dependencies": {
     "@fastify/compress": "^8.3.1",
     "@fastify/cookie": "^11.0.2",
+    "@fastify/static": "^9.3.0",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^4.0.2",
     "@nestjs/core": "^11.0.1",
     "@nestjs/platform-fastify": "^11.1.13",
+    "@nestjs/swagger": "^11.4.8",
     "@nestjs/terminus": "^11.0.0",
     "@nestjs/throttler": "^6.5.0",
     "@nestjs/typeorm": "^11.0.1",

@@ -1,3 +1,4 @@
+import { ApiProperty } from '@nestjs/swagger';
 import { IsString, Matches, MaxLength, MinLength } from 'class-validator';
 
 import { NormalizedEmail } from '../decorators/normalized-email.decorator';
@@ -16,6 +17,14 @@ export class RegisterDto {
    * Policy: 8+ characters, at least one letter of any alphabet and one digit,
    * and a maximum length so an attacker can't make us hash megabytes.
    */
+  @ApiProperty({
+    format: 'password',
+    minLength: 8,
+    maxLength: 128,
+    example: 'correct horse 42',
+    description:
+      'At least one letter (any alphabet) and one digit. Leading/trailing spaces are kept.',
+  })
   @IsString()
   @MinLength(8, {
     message: 'password must be at least 8 characters long',

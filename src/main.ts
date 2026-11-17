@@ -12,6 +12,7 @@ import {
 
 import { AppModule } from './core/app/app.module';
 import { ConfigService } from '@/core/config/config.service';
+import { setupApiDocs } from '@/core/docs/api-docs';
 
 async function bootstrap() {
   initializeTransactionalContext({ storageDriver: StorageDriver.AUTO });
@@ -40,6 +41,8 @@ async function bootstrap() {
   await app.register(fastifyCookie, {
     secret: configService.get('COOKIE_SECRET'),
   });
+
+  setupApiDocs(app, configService);
 
   const port = configService.get('PORT');
 

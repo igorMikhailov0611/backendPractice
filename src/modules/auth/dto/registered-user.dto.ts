@@ -1,3 +1,5 @@
+import { ApiProperty } from '@nestjs/swagger';
+
 import { User, UserStatus } from '@/modules/users/entities/user.entity';
 
 /**
@@ -6,8 +8,13 @@ import { User, UserStatus } from '@/modules/users/entities/user.entity';
  * "Пароль, хеш и токены в ответ не входят."
  */
 export class RegisteredUserDto {
+  @ApiProperty({ format: 'uuid' })
   id: string;
+
+  @ApiProperty({ format: 'email', example: 'user@example.com' })
   email: string;
+
+  @ApiProperty({ enum: UserStatus, example: UserStatus.Active })
   status: UserStatus;
 }
 

@@ -54,6 +54,11 @@ export const configValidationSchema = Joi.object<Config>({
   POSTGRES_MIGRATIONS_RUN: Joi.boolean().optional().default(false),
 
   /**
+   * API docs at /docs. Off unless asked for: a public map of every endpoint helps attackers more than users.
+   */
+  API_DOCS_ENABLED: Joi.boolean().optional().default(false),
+
+  /**
    * Registration (spec §2 "Registration Flow")
    */
   REGISTRATION_EMAIL_CONFIRMATION_ENABLED: Joi.boolean()
