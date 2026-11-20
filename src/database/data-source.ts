@@ -11,7 +11,8 @@ import { DataSource } from 'typeorm';
  * this file exists solely so the CLI can load the same connection
  * settings from .env without booting the whole Nest application.
  */
-export const dataSource = new DataSource({
+// Only a default export: the TypeORM CLI rejects a file that exports more than one DataSource.
+const dataSource = new DataSource({
   type: 'postgres',
   host: process.env.POSTGRES_HOST,
   port: Number(process.env.POSTGRES_PORT),
@@ -22,7 +23,7 @@ export const dataSource = new DataSource({
   entities: [__dirname + '/../**/*.entity{.ts,.js}'],
 
   migrationsTableName: 'migrations',
-  migrations: [__dirname + '/migrations/*.migration{.ts,.js}'],
+  migrations: [__dirname + '/migrations/*-*{.ts,.js}'],
 
   synchronize: false,
   logging: process.env.POSTGRES_LOGGING === 'true',

@@ -17,8 +17,9 @@ paths:
   → RBAC permission → ownership (`*_any` permission to bypass).
 - Tokens are read **only** from HttpOnly cookies, never from the `Authorization` header or the body. Cookie
   attributes must match the spec table (refresh cookie `Path=/auth/refresh`).
-- **Anti-enumeration:** login/registration responses must not reveal whether an email exists. On unknown email,
-  still run a dummy hash verification to equalise timing.
+- **Anti-enumeration:** login responses must not reveal whether an email exists. On unknown email,
+  still run a dummy hash verification to equalise timing. Registration is the deliberate exception: it returns an
+  explicit `409` for a taken email (mentor's [registration_requirements.md](../../docs/registration_requirements.md) §1.4).
 - Compare secrets/HMACs with `crypto.timingSafeEqual`, never `===`.
 - Generate tokens/codes with `crypto.randomBytes` / `crypto.randomInt`, never `Math.random`.
 - Never put secrets, OTP codes, magic-link tokens, password hashes or JWTs in responses (except cookies) or logs.
