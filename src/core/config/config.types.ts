@@ -47,6 +47,26 @@ export interface Config {
   LOGIN_CHALLENGE_HMAC_KEY: string;
 
   /**
+   * Authentication (mentor's authentication_requirements.md §1.1, §1.3.3)
+   */
+  /** HS256 key for access JWTs (>= 32 bytes, differs from every other crypto key) */
+  JWT_ACCESS_SECRET: string;
+  /** HS256 key for refresh JWTs (>= 32 bytes, differs from every other crypto key) */
+  JWT_REFRESH_SECRET: string;
+  /** HMAC key for the irreversible email identifier in logs and login_failures (mentor 1.5) */
+  AUDIT_EMAIL_HMAC_KEY: string;
+  JWT_ISSUER: string;
+  JWT_AUDIENCE: string;
+  LOGIN_EMAIL_CONFIRMATION_ENABLED?: boolean;
+  LOGIN_EMAIL_CONFIRMATION_METHOD?: 'otp' | 'magic_link';
+  /** Comma-separated exact origins allowed by CORS and the CSRF check. Empty = same-origin only */
+  TRUSTED_ORIGINS?: string;
+  /** true → both auth cookies get SameSite=None; Secure (frontend on another site) */
+  AUTH_COOKIE_CROSS_SITE?: boolean;
+  /** Max login / refresh requests per minute per IP (mentor 1.6) */
+  AUTH_RATE_LIMIT?: number;
+
+  /**
    * Outgoing mail (SMTP)
    */
   SMTP_HOST: string;

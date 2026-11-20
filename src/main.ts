@@ -12,6 +12,7 @@ import {
 
 import { AppModule } from './core/app/app.module';
 import { ConfigService } from '@/core/config/config.service';
+import { parseTrustedOrigins } from '@/core/config/config.validation';
 import { setupApiDocs } from '@/core/docs/api-docs';
 
 async function bootstrap() {
@@ -24,19 +25,18 @@ async function bootstrap() {
 
   await app.register(compression);
 
+  const configService = app.get(ConfigService);
+
+  // Exact origins only: `*` is not allowed together with credentials (mentor 1.3.3).
+  // X-CSRF-Protection must be allowed, or the preflight blocks every cross-origin POST.
   app.enableCors({
-    origin: [
-      'http://localhost:5174',
-      'http://localhost:4200',
-      'http://localhost:8080',
-    ],
+    origin: parseTrustedOrigins(configService.get('TRUSTED_ORIGINS')),
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
+    allowedHeaders: ['Content-Type', 'X-CSRF-Protection'],
     credentials: true,
     preflightContinue: false,
     optionsSuccessStatus: 204,
   });
-
-  const configService = app.get(ConfigService);
 
   await app.register(fastifyCookie, {
     secret: configService.get('COOKIE_SECRET'),
