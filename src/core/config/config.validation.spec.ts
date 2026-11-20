@@ -1,7 +1,10 @@
 import Joi from 'joi';
 
 import { Config } from './config.types';
-import { configValidationSchema } from './config.validation';
+import {
+  configValidationSchema,
+  parseTrustedOrigins,
+} from './config.validation';
 
 /** Minimal env that satisfies every required key. */
 const validEnv = {
@@ -14,6 +17,11 @@ const validEnv = {
   POSTGRES_PASSWORD: 'postgres',
   POSTGRES_DB: 'backend_practice',
   LOGIN_CHALLENGE_HMAC_KEY: 'k'.repeat(32),
+  JWT_ACCESS_SECRET: 'a'.repeat(32),
+  JWT_REFRESH_SECRET: 'r'.repeat(32),
+  AUDIT_EMAIL_HMAC_KEY: 'e'.repeat(32),
+  JWT_ISSUER: 'backend-practice-api',
+  JWT_AUDIENCE: 'backend-practice-web',
   SMTP_HOST: 'localhost',
   SMTP_PORT: '1025',
   SMTP_FROM: 'Backend Practice <no-reply@localhost>',
@@ -97,6 +105,103 @@ describe('configValidationSchema', () => {
     expect(
       validate({ SMTP_USER: 'user', SMTP_PASS: 'pass' }).error,
     ).toBeUndefined();
+  });
+
+  describe('authentication keys (mentor 1.1)', () => {
+    it('applies auth defaults', () => {
+      expect(validate().value as Config).toMatchObject({
+        LOGIN_EMAIL_CONFIRMATION_ENABLED: false,
+        LOGIN_EMAIL_CONFIRMATION_METHOD: 'otp',
+        TRUSTED_ORIGINS: '',
+        AUTH_COOKIE_CROSS_SITE: false,
+        AUTH_RATE_LIMIT: 30,
+      });
+    });
+
+    it.each([
+      'JWT_ACCESS_SECRET',
+      'JWT_REFRESH_SECRET',
+      'AUDIT_EMAIL_HMAC_KEY',
+      'JWT_ISSUER',
+      'JWT_AUDIENCE',
+    ])('rejects a missing %s (no default value)', (key) => {
+      expect(errorPaths({ [key]: undefined })).toEqual([key]);
+    });
+
+    it.each([
+      'JWT_ACCESS_SECRET',
+      'JWT_REFRESH_SECRET',
+      'AUDIT_EMAIL_HMAC_KEY',
+    ])('rejects a 31-byte %s', (key) => {
+      expect(errorPaths({ [key]: 'x'.repeat(31) })).toEqual([key]);
+    });
+
+    it('rejects an unknown login confirmation method', () => {
+      expect(errorPaths({ LOGIN_EMAIL_CONFIRMATION_METHOD: 'sms' })).toEqual([
+        'LOGIN_EMAIL_CONFIRMATION_METHOD',
+      ]);
+    });
+  });
+
+  describe('distinct crypto keys (mentor 1.1: a shared key is forbidden)', () => {
+    it('accepts four different keys', () => {
+      expect(validate().error).toBeUndefined();
+    });
+
+    it.each([
+      ['JWT_ACCESS_SECRET', 'JWT_REFRESH_SECRET'],
+      ['JWT_ACCESS_SECRET', 'LOGIN_CHALLENGE_HMAC_KEY'],
+      ['JWT_REFRESH_SECRET', 'AUDIT_EMAIL_HMAC_KEY'],
+      ['LOGIN_CHALLENGE_HMAC_KEY', 'AUDIT_EMAIL_HMAC_KEY'],
+    ])('rejects %s equal to %s, naming both keys', (first, second) => {
+      const shared = 's'.repeat(40);
+      const message = validate({ [first]: shared, [second]: shared }).error
+        ?.message;
+
+      expect(message).toContain(first);
+      expect(message).toContain(second);
+    });
+
+    it('never echoes the shared value', () => {
+      const shared = 's'.repeat(40);
+      const message = validate({
+        JWT_ACCESS_SECRET: shared,
+        JWT_REFRESH_SECRET: shared,
+      }).error?.message;
+
+      expect(message).toBeDefined();
+      expect(message).not.toContain(shared);
+    });
+  });
+
+  describe('TRUSTED_ORIGINS', () => {
+    it('accepts a comma-separated list of exact origins', () => {
+      expect(
+        validate({
+          TRUSTED_ORIGINS: 'http://localhost:4200, https://app.example.com',
+        }).error,
+      ).toBeUndefined();
+    });
+
+    it.each([
+      '*',
+      'https://app.example.com/',
+      'https://app.example.com/login',
+      'ftp://app.example.com',
+      'app.example.com',
+    ])('rejects "%s"', (origin) => {
+      expect(errorPaths({ TRUSTED_ORIGINS: origin })).toEqual([
+        'TRUSTED_ORIGINS',
+      ]);
+    });
+
+    it('parses the list the same way main.ts reads it', () => {
+      expect(parseTrustedOrigins(' http://a.test ,, https://b.test ')).toEqual([
+        'http://a.test',
+        'https://b.test',
+      ]);
+      expect(parseTrustedOrigins('')).toEqual([]);
+    });
   });
 
   it('rejects a FRONTEND_BASE_URL that is not http(s)', () => {

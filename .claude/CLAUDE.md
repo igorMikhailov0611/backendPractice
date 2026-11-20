@@ -10,6 +10,12 @@ implementing any feature, and quote the section you are implementing in your pla
 (explicit 409, `{id, email, status}` responses, keep `pending` on SMTP failure, resend by `email`, magic-link token
 without an id). The reconciled decisions are in [docs/registration_feature_implementation_plan.md](../docs/registration_feature_implementation_plan.md).
 
+**Exception — authentication:** for `POST /auth/login`, `/login/confirm`, `/login/resend`, `/auth/refresh`, `/auth/logout`
+and the global access check, the mentor's [docs/authentication_requirements.md](../docs/authentication_requirements.md)
+wins over the spec (503 with `attemptId` on SMTP failure, `attemptId.secret` magic link, `consumed_reason`, resend by
+`attemptId`, `SameSite=None` for cross-site). The reconciled decisions are in
+[docs/authentication_feature_implementation_plan.md](../docs/authentication_feature_implementation_plan.md).
+
 ## Who you are working with
 
 The developer is an experienced **frontend** developer learning backend to become fullstack. This is a
@@ -26,7 +32,8 @@ training project, so learning matters as much as working code:
 ## Commands
 
 ```bash
-docker compose up -d          # local Postgres (reads .env)
+cp .env.example .env          # first run only, then fill in the secrets
+docker compose up -d          # local Postgres + Mailpit (reads .env)
 npm run start:dev             # dev server with watch
 npm run build                 # tsc via nest build — use as the type-check
 npm run lint                  # eslint --fix
@@ -89,16 +96,3 @@ src/modules/<feature>/
 - **Security defaults from the spec:** endpoints are private by default (`@Public()` opt-out), auth comes from
   HttpOnly cookies only, never log secrets/passwords/tokens, auth failures return generic messages.
 - Tests use Jest + `@nestjs/testing`. Unit test services with mocked repositories; e2e for HTTP flows.
-
-## Known gaps in the boilerplate (fix when the related feature is touched)
-
-- `.env.example` is the template for `.env`; copy it and fill in secrets before running.
-- Migration glob in `database.module.ts` / `data-source.ts` is `*.migration{.ts,.js}`, but
-  `npm run migration:generate` produces `<timestamp>-Migration.ts`, which does **not** match — migrations would
-  be silently ignored. Align the file naming and the glob before the first migration.
-- Jest config has no `moduleNameMapper` for `@/` → unit tests importing via `@/` will fail to resolve.
-- Global `ValidationPipe` has `whitelist: true` but not `forbidNonWhitelisted: true` / `transform: true` required by spec §1.
-- `test/app.e2e-spec.ts` is the stale Nest default (expects `GET /` → "Hello World!"), and e2e uses the Express
-  adapter rather than Fastify.
-- `ThrottlerModule` is configured but no `ThrottlerGuard` is registered, so rate limiting is not active yet.
-- `AuthModule` exists but is not imported in `AppModule`.
